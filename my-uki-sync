@@ -1,0 +1,165 @@
+#!/bin/bash
+# my-uki-sync: build UKIs, keep pcrlock components in sync, refresh the pcrlock policy
+#   my-uki-sync                  at boot / manually: promote, prune, predict, make-policy, copy
+#   my-uki-sync --kernel KVER    (re)build the UKI for KVER (repeatable; for kernel install hooks)
+#   my-uki-sync --rebuild-all    rebuild the UKIs of all installed kernels (after dracut config changes)
+#   my-uki-sync --remove KVER    kernel removed: delete its UKI
+#   my-uki-sync --dry            stop after predict (policy is not touched)
+# Which pcrlock files are needed to explain the booted chain is decided by removing them one at a time
+# and checking whether "predict --pcr=4" still succeeds, so all the calculation is left to systemd-pcrlock.
+set -euo pipefail
+shopt -s nullglob
+
+# --- site-specific settings (shared with my-build-uki) ---
+HERE=$(dirname "$(realpath "$0")")
+source "$HERE/uki-pcrlock.conf.sh"
+BUILD_UKI=$HERE/my-build-uki                    # called as: $BUILD_UKI KVER OUTPUT_PATH
+POLICY_DST=$XBTL/$POLICY_REL
+
+# --- standard paths / settings ---
+SD=/var/lib/systemd
+RUN_SD=/run/systemd
+HIDE="/boot/efi /efi /boot"                     # unmounted during make-policy (pcrlock's ESP/XBOOTLDR candidates)
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+KERNELS=() REMOVES=() ALL=0 DRY=0 BUILT=() DIS= PRED= BASE_OK=0
+while (( $# )); do
+  case $1 in
+    --kernel) KERNELS+=("$2"); shift ;;
+    --remove) REMOVES+=("$2"); shift ;;
+    --rebuild-all) ALL=1 ;;
+    --dry) DRY=1 ;;
+    *) sed -n '2,8p' "$0"; exit 1 ;;
+  esac
+  shift
+done
+
+# predict succeeds and no PCR was dropped from the set (output is kept in $PRED).
+# "not matching any component" is also printed for PCRs outside --pcr, so it must not be matched.
+predict_check() {
+  PRED=$("$PCRLOCK" predict "$@" 2>&1) || return 1
+  ! grep -Eiq 'Removing from set of PCRs|PCRs dropped from protection mask|No PCRs kept' <<<"$PRED"
+}
+
+# Remove files with identical content, first wins (glob order puts current < linuxmint-* < new).
+dedupe() {
+  local -A s=(); local f h
+  for f in "$1"/*.pcrlock; do
+    h=$(sha256sum <"$f")
+    if [[ -n ${s[$h]:-} ]]; then rm -f "$f"; else s[$h]=1; fi
+  done
+}
+
+# Put into variable $2 (newline separated) the files in dir $1 whose removal breaks predict,
+# i.e. the files needed to explain the booted event log.
+needed() {
+  local f out=
+  if (( BASE_OK )); then
+    for f in "$1"/*.pcrlock; do
+      DIS=$f; mv "$f" "$f.off"
+      if ! predict_check --pcr=4; then out+="$f"$'\n'; fi
+      mv "$f.off" "$f"; DIS=
+    done
+  fi
+  printf -v "$2" %s "$out"
+}
+
+# shim / sd-boot: rebuild the dir as current (needed for the booted chain) + new (what is on disk now).
+sync_component() {   # dir efi lock-command need
+  local dir=$1 cand=$TMP/cand.${1##*/} cur=${4%%$'\n'*}
+  $3 "$2" --pcrlock="$cand" >/dev/null
+  [[ -n $cur ]] || cur=$dir/current.pcrlock
+  [[ -f $cur ]] || cur=$cand                       # first run / undetectable: assume disk == booted
+  cp "$cur" "$cand.cur"
+  rm -f "$dir"/*.pcrlock
+  install -m 0644 "$cand.cur" "$dir/current.pcrlock"
+  cmp -s "$cand" "$dir/current.pcrlock" || install -m 0644 "$cand" "$dir/new.pcrlock"
+}
+
+build_uki() {   # kver
+  local out=$UKI_DIR/$UKI_PREFIX$1.efi
+  echo "build $1" >&2
+  "$BUILD_UKI" "$1" "$out.new"
+  mv -f "$out.new" "$out"          # sd-boot ignores *.new; the swap is only this final mv
+  BUILT+=("$UKI_PREFIX$1")
+}
+
+# Keep at most n UKI variants. Priority: needed for the booted chain > built in this run > newest kernel first.
+sync_uki() {   # n need
+  local n=$1 nd=$TMP/uki cur=${2%%$'\n'*} u x f h prot= ok=() ng=() keep=() order=()
+  local -A seen=()
+  mkdir -p "$nd"
+  for u in "$UKI_DIR"/*.efi; do
+    $LOCK_UKI "$u" --pcrlock="$nd/$(basename "$u" .efi).pcrlock" >/dev/null
+  done
+  if [[ -n $cur ]]; then      # same content after the rebuild -> that file; replaced UKI -> keep as current.pcrlock
+    for f in "$nd"/*.pcrlock; do if cmp -s "$cur" "$f"; then prot=$f; fi; done
+    if [[ -z $prot ]]; then prot=$nd/current.pcrlock; install -m 0644 "$cur" "$prot"; fi
+  fi
+  mapfile -t order < <({ echo "$prot"; for x in "${BUILT[@]}"; do echo "$nd/$x.pcrlock"; done
+                         printf '%s\n' "$nd"/*.pcrlock | sort -Vr; })
+  for f in "${order[@]}"; do
+    [[ -f $f ]] || continue
+    h=$(sha256sum <"$f"); [[ -z ${seen[$h]:-} ]] || continue
+    (( ${#keep[@]} < n )) || break
+    seen[$h]=1; keep+=("$f")
+  done
+  rm -f "$UKI_D"/*.pcrlock; cp -t "$UKI_D" "${keep[@]}"
+
+  for u in "$UKI_DIR"/*.efi; do
+    x=$(basename "$u" .efi)
+    if [[ -n ${seen[$(sha256sum <"$nd/$x.pcrlock")]:-} ]]; then ok+=("${x#"$UKI_PREFIX"}"); else ng+=("${x#"$UKI_PREFIX"}"); fi
+  done
+  echo "UKIs that can auto-unlock at next boot: ${ok[*]:-none}"
+  if (( ${#ng[@]} )); then echo "UKIs dropped by the $MAX_BRANCHES-branch limit (passphrase needed): ${ng[*]}"; fi
+}
+
+exec 9>/run/my-uki-sync.lock; flock 9
+TMP=$(mktemp -d /var/tmp/my-uki-sync.XXXXXX)
+trap 'rm -rf "$TMP"; if [[ -n $DIS ]]; then mv "$DIS.off" "$DIS" 2>/dev/null || true; fi' EXIT
+
+for d in "$SHIM_D" "$SDBOOT_D" "$UKI_D"; do mkdir -p "$d"; dedupe "$d"; done
+if predict_check --pcr=4; then BASE_OK=1; fi
+needed "$SHIM_D" NEED_SHIM; needed "$SDBOOT_D" NEED_SDBOOT; needed "$UKI_D" NEED_UKI   # judged before anything changes
+
+for k in "${REMOVES[@]}"; do rm -f "$UKI_DIR/$UKI_PREFIX$k.efi"; done
+sync_component "$SHIM_D"   "$SHIM_EFI"   "$LOCK_PE_FIRST"   "$NEED_SHIM"
+sync_component "$SDBOOT_D" "$SDBOOT_EFI" "$LOCK_PE_OTHER"   "$NEED_SDBOOT"
+if (( ALL )); then for f in /boot/vmlinuz-*; do KERNELS+=("${f#/boot/vmlinuz-}"); done; fi
+for k in "${KERNELS[@]}"; do build_uki "$k"; done
+
+N=$(( MAX_BRANCHES / $(printf '%s\n' "$SHIM_D"/*.pcrlock | wc -l) / $(printf '%s\n' "$SDBOOT_D"/*.pcrlock | wc -l) ))
+(( N >= 1 )) || die "shim x sd-boot variants exceed the limit of $MAX_BRANCHES"
+sync_uki "$N" "$NEED_UKI"
+
+predict_check --pcr=$INCLUDE_PCRS || die "predict failed or a PCR was dropped (policy not updated):"$'\n'"$PRED"
+if (( DRY )); then exit 0; fi
+
+# --- make-policy ---
+# The master policy (with PIN) stays at $SD/pcrlock.json, mode 600. make-policy runs in a private mount
+# namespace where the ESP/XBOOTLDR are unmounted (so no PIN-bearing credential is written there) and $PROT is
+# bind-mounted over $SD, so a changed policy is generated into $PROT. The master is copied to $RUN_SD
+# beforehand because pcrlock also reads it from there. Afterwards, still in the namespace, delete any
+# credential that landed in the directories underneath the unmounted mount points.
+install -d -m 0700 "$PROT"; rm -f "$PROT/pcrlock.json"
+if [[ -f $SD/pcrlock.json ]]; then install -m 0600 "$SD/pcrlock.json" "$RUN_SD/pcrlock.json"; fi
+HIDE=$HIDE unshare -m sh -c '
+  umount -l $HIDE 2>/dev/null                                   # paths that are not mounted fail harmlessly
+  for m in $HIDE; do ! mountpoint -q "$m" || exit 1; done      # but nothing may remain mounted
+  mount --bind "$1" "$2" || exit 1
+  shift 2; "$@"; rc=$?
+  for m in $HIDE; do
+    rm -f "$m"/loader/credentials/pcrlock.*.cred
+    rmdir "$m/loader/credentials" "$m/loader" 2>/dev/null
+  done
+  exit $rc' sh "$PROT" "$SD" "$PCRLOCK" make-policy --pcr=$INCLUDE_PCRS
+rm -f "$RUN_SD/pcrlock.json"
+if [[ -f $PROT/pcrlock.json ]]; then               # only generated when the policy changed
+  chmod 600 "$PROT/pcrlock.json"; mv -f "$PROT/pcrlock.json" "$SD/pcrlock.json"
+fi
+chmod 600 "$SD/pcrlock.json"
+
+# XBOOTLDR copy: PIN replaced with a dummy
+sed -E 's/("pin(Private|Public)" *: *")[^"]*"/\1AAAA"/g' "$SD/pcrlock.json" > "$POLICY_DST.tmp"
+mv -f "$POLICY_DST.tmp" "$POLICY_DST"

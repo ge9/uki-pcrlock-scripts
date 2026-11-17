@@ -1,0 +1,52 @@
+#!/bin/bash
+set -euo pipefail
+
+HERE=$(dirname "$(realpath "$0")")
+source "$HERE/uki-pcrlock.conf.sh"
+
+KVER="${1:-$(uname -r)}"
+OUTPUT=${2:-$UKI_DIR/${UKI_PREFIX}${KVER}.efi}
+
+WORK=$(mktemp -d /var/tmp/uki-work.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+INITRD="$WORK/initrd"
+LIST="$WORK/initrd-list"
+PART_UUID_ESC=${PART_UUID//-/\\\\x2d}
+sed -e "s|@PART_UUID@|$PART_UUID|g" -e "s|@POLICY_FILE@|$POLICY_REL|g" \
+  "$HERE/place-policy.sh" > "$WORK/place.sh"
+sed -e "s|@PART_UUID_ESC@|$PART_UUID_ESC|g" -e "s|@PLACE_SCRIPT@|$PLACE_SCRIPT_DST|g" \
+  "$HERE/place-policy.conf" > "$WORK/dropin.conf"
+chmod 755 "$WORK/place.sh"
+
+dracut --force --confdir "$DRACUT_CONF" \
+--include "$WORK/place.sh" "$PLACE_SCRIPT_DST" \
+--include "$WORK/dropin.conf" "$PLACE_DROPIN_DST" \
+$DRACUT_ARG \
+--kver "$KVER" "$INITRD"
+lsinitrd "$INITRD" > "$LIST"
+
+# Patterns that must appear in the initrd listing
+need=('systemd-cryptsetup$' 'libcryptsetup-token-systemd-tpm2')
+
+# systemd < 262: systemd-cryptsetup extends PCR 15 by itself, nothing more is needed.
+# systemd >= 262: it asks systemd-pcrextend over Varlink, so the binary, socket and service template
+# must be in the initrd; otherwise the measurement is skipped with only a warning.
+if (( $(systemctl --version | awk 'NR==1{print $2}') >= 262 )); then
+  need+=('usr/lib/systemd/systemd-pcrextend$' 'systemd-pcrextend\.socket' 'systemd-pcrextend@\.service'
+         'sockets\.target\.wants/systemd-pcrextend\.socket')
+fi
+
+missing=()
+for p in "${need[@]}"; do grep -q -- "$p" "$LIST" || missing+=("$p"); done
+if (( ${#missing[@]} )); then echo "initrd is missing: ${missing[*]}" >&2; exit 1; fi
+
+mkdir -p "$(dirname "$OUTPUT")"
+"$UKIFY" build \
+  --linux  "/boot/vmlinuz-${KVER}" \
+  --initrd "$INITRD" \
+  $UKIFY_ARG \
+  --cmdline @/etc/kernel/cmdline \
+  --uname "${KVER}" \
+  --secureboot-private-key  "${KEYDIR}/MOK.priv" \
+  --secureboot-certificate  "${KEYDIR}/MOK.pem" \
+  --output "$OUTPUT"

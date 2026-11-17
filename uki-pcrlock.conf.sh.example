@@ -1,0 +1,47 @@
+# uki-pcrlock.conf.sh: settings shared by my-build-uki and my-uki-sync (sourced by both).
+# Keep this folder root-owned and not writable by others: the files in it are run as root.
+
+# --- XBOOTLDR partition (holds the UKIs and the PIN-less policy copy) ---
+PART_UUID=ABCD-1234                             # filesystem (vfat) UUID, as in /dev/disk/by-uuid/
+XBTL=/boot/xbtl                                 # where it is mounted in the running system
+LUKS_NAME=ll
+UKI_DIR=$XBTL/EFI/Linux
+UKI_PREFIX=uki-                                 # UKI file name: ${UKI_PREFIX}KVER.efi
+POLICY_REL=pcrlock.json                          # PIN-less copy of pcrlock.json, relative to the XBOOTLDR root
+
+# --- dracut ---
+DRACUT_CONF="/etc/dracut.conf.d.custom"
+DRACUT_ARG=""
+# when plymouthd.conf is missing (Debian-based distros):
+# DRACUT_ARG="$DRACUT_ARG --include $(realpath /usr/share/plymouth/themes/default.plymouth) /usr/share/plymouth/themes/default.plymouth"
+
+# --- ukify ---
+UKIFY=$(command -v ukify || echo /usr/lib/systemd/ukify)
+KEYDIR=/my/uefi/MOK
+UKIFY_ARG=""
+# UKIFY_ARG="$UKIFY_ARG --stub /my/uefi/sd-boot-new/usr/lib/systemd/boot/efi/linuxx64.efi.stub"
+
+# --- boot chain files measured into PCR 4 ---
+SHIM_EFI=/boot/efi/EFI/ubuntu-uki/shimx64.efi
+SDBOOT_EFI=/boot/efi/EFI/ubuntu-uki/grubx64.efi
+
+# --- pcrlock commands ---
+
+PCRLOCK="/usr/lib/systemd/systemd-pcrlock"
+LOCK_PE_FIRST="$PCRLOCK lock-pe"
+LOCK_PE_OTHER="$PCRLOCK lock-pe"                # normally "$PCRLOCK lock-pe", but "$PCRLOCK lock-raw --pcr=4" for some irregular UEFI implementation
+LOCK_UKI="$PCRLOCK lock-pe"                     # same as above, but if lock-raw says "Argument list too long.", use "$HERE/lock-raw.py --pcr=4"
+# --- pcrlock components ---
+PL=/var/lib/pcrlock.d
+SHIM_D=$PL/606-shim.pcrlock.d
+SDBOOT_D=$PL/616-sdboot.pcrlock.d
+UKI_D=$PL/626-uki.pcrlock.d
+
+# --- pcrlock policy ---
+PROT=/var/lib/systemd-protected                 # root-only dir that receives a newly generated pcrlock.json
+MAX_BRANCHES=8                                  # PolicyOR limit; expected to grow with systemd 263
+INCLUDE_PCRS=0,2,4,12,13                        # e.g. 0,2,4,12,13
+
+# --- files placed into the initrd (templates live next to the scripts) ---
+PLACE_SCRIPT_DST=/usr/local/sbin/initrd-place-policy.sh
+PLACE_DROPIN_DST=/etc/systemd/system/systemd-cryptsetup@$LUKS_NAME.service.d/place-policy.conf   # adjust to your unit
